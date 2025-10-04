@@ -1,75 +1,64 @@
-# My Proxy
+# My Proxy Server
 
-An Express-based HTTP proxy with dynamic whitelist/blacklist access control intended to sit in front of a Chrome MCP server (or other upstream services). It provides hot-reloading of access lists and a health endpoint.
+## Overview
 
-## Features
+Đây là một proxy HTTP nhỏ viết bằng Express, dùng danh sách đen (blacklist) dạng substring (không phân biệt hoa thường) nằm trong thư mục cấu hình. Proxy hỗ trợ cả HTTP proxying và HTTP CONNECT (dùng để tunnel HTTPS). Server có endpoint `/health` trả trạng thái và phiên bản danh sách đen.
 
-- Dynamic whitelist & blacklist loaded from `src/config/whitelist.txt` and `src/config/blacklist.txt`
-- Automatic reload of lists on file changes
-- Optional static upstream target via `TARGET_HOST` environment variable
-- Fallback dynamic host mode (uses incoming `Host` header)
-- Structured middleware (logging via morgan, access control, proxy handler, error handler)
-- Health endpoint at `/health`
+## How to run
 
-## Environment Variables
+Chạy file đã biên dịch và truyền đường dẫn tới thư mục cấu hình làm tham số đầu tiên:
 
-| Variable      | Description                                                                                              | Default |
-| ------------- | -------------------------------------------------------------------------------------------------------- | ------- |
-| `PORT`        | Port for proxy server                                                                                    | `8080`  |
-| `TARGET_HOST` | Force all traffic to single upstream (e.g. `http://localhost:9000`). If unset dynamic host mode is used. | (unset) |
+node <đường dẫn tới file dist/proxy-server.js> <đường dẫn tới thư mục config>
 
-## Usage
+Ví dụ (từ thư mục gốc dự án sau khi `npm run build`):
 
-Install dependencies:
-
-```bash
-npm install
+```javascript
+node dist/proxy-server.js config
 ```
 
-Run in development (ts-node):
+## How to integrate
 
-```bash
-npm run dev
+Khi muốn tích hợp vào cấu hình MCP (ví dụ trong `mcp.json` hoặc một file cấu hình khởi chạy Chrome), chỉ cần chỉ định proxy server là địa chỉ host:port nơi proxy đang chạy. Ví dụ `mcp.json` có thể chứa trường cấu hình tương tự (dưới đây là ví dụ minh họa):
+
+```json
+{
+  "proxyServer": "localhost:8080"
+}
 ```
 
-Build & start (production style):
+Hoặc khi khởi chạy Chrome/MCP trực tiếp, thêm flag tương ứng:
 
-```bash
-npm run build
-npm start
+```json
+{
+  "servers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--proxyServer=http://localhost:8080"
+      ]
+    }
+  },
+  "inputs": []
+}
 ```
 
-Health check:
+## Blacklist (cú pháp)
 
-```bash
-curl http://localhost:8080/health
+Tệp `blacklist.txt` nằm trong thư mục cấu hình (`<config-dir>/blacklist.txt`). Quy tắc:
+
+- Một mục trên một dòng.
+- So sánh theo substring, không phân biệt hoa thường (ví dụ `example.com` sẽ khớp `sub.example.com`).
+- Các dòng rỗng sẽ bị bỏ qua.
+- Các dòng bắt đầu bằng `#` được xem là comment và sẽ bị bỏ qua.
+
+Ví dụ `config/blacklist.txt`:
+
 ```
+# chặn domain ví dụ
+example.com
 
-Chrome MCP launch flag example:
-
+# chặn loopback
+127.0.0.1
 ```
---proxyServer=http://localhost:8080
-```
-
-## Access Control Lists
-
-- Whitelist: if non-empty, only hosts containing one of the whitelist entries are allowed.
-- Blacklist: any host containing a blacklist entry is blocked.
-- Substring matching (case-insensitive).
-
-## Extending
-
-Add new middleware before the proxy catch-all (`app.use('*', ...)`) in `src/proxy-server.ts`.
-
-Potential enhancements:
-
-- Rate limiting middleware
-- Metrics / Prometheus endpoint
-- Structured JSON logging option
-- ETag / caching layer for static assets
-- Configurable matching mode (exact, wildcard, regex)
-- Unit tests (Jest) and integration tests with supertest
-
-## License
-
-ISC

@@ -26,8 +26,10 @@ function loadLists() {
             access.blacklist = new Set(
                 fs.readFileSync(BLACKLIST_FILE, 'utf-8')
                     .split(/\r?\n/)
-                    .map(l => l.trim().toLowerCase())
+                    .map(l => l.trim())
+                    .map(l => l.toLowerCase())
                     .filter(Boolean)
+                    .filter(l => !l.startsWith('#'))
             );
         }
         access.version++;
