@@ -5,12 +5,12 @@ import { createProxyMiddleware } from 'http-proxy-middleware';
 import type { Options } from 'http-proxy-middleware';
 import path from 'path';
 import fs from 'fs';
-import url from 'url';
 import http from 'http';
 import net from 'net';
 
-const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-const CONFIG_DIR = path.join(__dirname, 'config');
+// Accept config directory as a command-line argument
+const CONFIG_DIR = path.resolve(process.argv[2]!);
+
 const WHITELIST_FILE = path.join(CONFIG_DIR, 'whitelist.txt');
 const BLACKLIST_FILE = path.join(CONFIG_DIR, 'blacklist.txt');
 
@@ -155,6 +155,7 @@ const server = app.listen(PORT, () => {
     } else {
         console.log('Dynamic host mode: uses Host header from client requests.');
     }
+    console.log(`Config directory: ${CONFIG_DIR}`);
 });
 
 // Handle HTTP CONNECT (tunneling) so Chrome/clients can use this as an HTTP proxy for HTTPS

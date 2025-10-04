@@ -1,3 +1,0 @@
-example.com
-internal-site.com
-google.com

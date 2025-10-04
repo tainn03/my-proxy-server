@@ -5,11 +5,9 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "dev": "ts-node src/proxy-server.ts",
+    "dev": "ts-node src/proxy-server.ts config",
     "build": "tsc -p .",
-    "start": "node dist/proxy-server.js",
-    "lint": "echo 'No linter configured'",
-    "test": "node dist/test/health-check.js"
+    "start": "node dist/proxy-server.js config"
   },
   "keywords": [],
   "author": "",
