@@ -11,27 +11,17 @@ import net from 'net';
 // Accept config directory as a command-line argument
 const CONFIG_DIR = path.resolve(process.argv[2]!);
 
-const WHITELIST_FILE = path.join(CONFIG_DIR, 'whitelist.txt');
 const BLACKLIST_FILE = path.join(CONFIG_DIR, 'blacklist.txt');
 
 interface AccessLists {
-    whitelist: Set<string>;
     blacklist: Set<string>;
     version: number; // increments when reloaded
 }
 
-const access: AccessLists = { whitelist: new Set(), blacklist: new Set(), version: 0 };
+const access: AccessLists = { blacklist: new Set(), version: 0 };
 
 function loadLists() {
     try {
-        if (fs.existsSync(WHITELIST_FILE)) {
-            access.whitelist = new Set(
-                fs.readFileSync(WHITELIST_FILE, 'utf-8')
-                    .split(/\r?\n/)
-                    .map(l => l.trim().toLowerCase())
-                    .filter(Boolean)
-            );
-        }
         if (fs.existsSync(BLACKLIST_FILE)) {
             access.blacklist = new Set(
                 fs.readFileSync(BLACKLIST_FILE, 'utf-8')
@@ -41,7 +31,7 @@ function loadLists() {
             );
         }
         access.version++;
-        console.log(`Access lists reloaded v${access.version}: whitelist=${access.whitelist.size}, blacklist=${access.blacklist.size}`);
+        console.log(`Access lists reloaded v${access.version}: blacklist=${access.blacklist.size}`);
     } catch (e) {
         console.error('Failed to load access lists', e);
     }
@@ -50,7 +40,7 @@ function loadLists() {
 loadLists();
 
 fs.watch(CONFIG_DIR, (eventType, filename) => {
-    if (filename && (filename === 'whitelist.txt' || filename === 'blacklist.txt')) {
+    if (filename && filename === 'blacklist.txt') {
         console.log(`[watcher] Detected change in ${filename}, reloading lists...`);
         loadLists();
     }
@@ -58,15 +48,17 @@ fs.watch(CONFIG_DIR, (eventType, filename) => {
 
 // Config
 const PORT = Number(process.env.PORT || 8080);
-// If you want to force all traffic to specific upstream instead of dynamic host header, set TARGET_HOST.
-const STATIC_TARGET = process.env.TARGET_HOST; // e.g. http://localhost:9000
 
 // App
 const app = express();
 
 // Basic health endpoint
 app.get('/health', (_req: Request, res: Response) => {
-    res.json({ status: 'ok', listsVersion: access.version, whitelist: access.whitelist.size, blacklist: access.blacklist.size });
+    res.json({
+        status: 'ok',
+        listsVersion: access.version,
+        blacklist: Array.from(access.blacklist)
+    });
 });
 
 // Logging
@@ -74,56 +66,48 @@ app.use(morgan('dev'));
 
 // Access control middleware
 app.use((req: Request, res: Response, next: NextFunction) => {
-    const hostHeader = req.headers.host?.toLowerCase() || '';
-    const targetHost = STATIC_TARGET ? new URL(STATIC_TARGET).host : hostHeader;
+    const hostHeaderRaw = req.headers.host || '';
+    const hostHeaderLower = hostHeaderRaw.toLowerCase();
 
-    if (!targetHost) {
+    if (!hostHeaderLower) {
         return res.status(400).send('Missing target host');
     }
 
-    // Blacklist check (substring match)
+    // Blacklist check (substring match) using lowercased host for comparisons
     for (const entry of access.blacklist) {
-        if (targetHost.includes(entry)) {
+        if (hostHeaderLower.includes(entry)) {
             return res.status(403).send('Blocked by blacklist');
         }
     }
-    // Whitelist check if whitelist not empty
-    if (access.whitelist.size > 0) {
-        let allowed = false;
-        for (const entry of access.whitelist) {
-            if (targetHost.includes(entry)) { allowed = true; break; }
-        }
-        if (!allowed) {
-            return res.status(403).send('Not in whitelist');
-        }
-    }
-    // Attach chosen target to request for downstream middleware
-    (req as any)._targetHost = targetHost;
+
+    // Attach chosen target info to request for downstream middleware
+    // _targetHostRaw preserves original host:port as-sent by client (or static target host)
+    (req as any)._targetHostRaw = hostHeaderRaw;
+    // _targetHostLower is intended for logging/matching
+    (req as any)._targetHostLower = hostHeaderLower;
     next();
 });
 
 // Proxy middleware (catch-all) - only after access control
 app.use('*', (req: Request, res: Response, next: NextFunction) => {
-    const originalHost = req.headers.host;
-    const targetHost: string = (req as any)._targetHost;
-    const target = STATIC_TARGET ? STATIC_TARGET : `${req.protocol}://${targetHost}`;
+    const targetHostRaw: string = (req as any)._targetHostRaw;
+    const target = `${req.protocol}://${targetHostRaw}`;
+
+    console.log(target);
 
     // Avoid proxying health endpoint (already handled) - should not reach here due to route order.
     if (req.path === '/health') return next();
 
     console.log(`[proxy] ${req.method} ${req.originalUrl} -> ${target}`);
 
-    // Create per-request proxy to allow dynamic target
+    // Create per-request proxy to allow dynamic target while preserving the original Host header
     const opts: Options = {
         target,
-        changeOrigin: true,
+        changeOrigin: false,
         selfHandleResponse: false,
         on: {
             proxyReq: (proxyReq) => {
                 proxyReq.setHeader('x-proxy-by', 'my-proxy');
-                if (STATIC_TARGET && originalHost) {
-                    proxyReq.setHeader('x-forwarded-host', originalHost);
-                }
             },
             error: (err, _req, res) => {
                 console.error('[proxy:error]', err.message);
@@ -138,7 +122,6 @@ app.use('*', (req: Request, res: Response, next: NextFunction) => {
 });
 
 // Error handler
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     console.error('[error]', err);
     if (!res.headersSent) {
@@ -148,13 +131,8 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 
 const server = app.listen(PORT, () => {
     console.log(`Proxy server listening on http://localhost:${PORT}`);
-    console.log(`Lists: whitelist=${access.whitelist.size}, blacklist=${access.blacklist.size}`);
+    console.log(`Lists: blacklist=${access.blacklist.size}`);
     console.log('Chrome MCP: launch with --proxyServer=http://localhost:' + PORT);
-    if (STATIC_TARGET) {
-        console.log(`Static target mode: ${STATIC_TARGET}`);
-    } else {
-        console.log('Dynamic host mode: uses Host header from client requests.');
-    }
     console.log(`Config directory: ${CONFIG_DIR}`);
 });
 
@@ -165,23 +143,11 @@ server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head:
         const [host, portStr] = reqUrl.split(':');
         const port = Number(portStr) || 443;
 
-        const targetHost = STATIC_TARGET ? new URL(STATIC_TARGET).host : host;
+        const targetHostLower = String(host).toLowerCase();
 
-        // Blacklist check (substring match)
+        // Blacklist check (substring match) using lowercase comparison
         for (const entry of access.blacklist) {
-            if (String(targetHost).includes(entry)) {
-                clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-                clientSocket.destroy();
-                return;
-            }
-        }
-        // Whitelist check if whitelist not empty
-        if (access.whitelist.size > 0) {
-            let allowed = false;
-            for (const entry of access.whitelist) {
-                if (String(targetHost).includes(entry)) { allowed = true; break; }
-            }
-            if (!allowed) {
+            if (targetHostLower.includes(entry)) {
                 clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
                 clientSocket.destroy();
                 return;
