@@ -13,27 +13,99 @@ const CONFIG_DIR = path.resolve(process.argv[2]!);
 
 const BLACKLIST_FILE = path.join(CONFIG_DIR, 'blacklist.txt');
 
-interface AccessLists {
-    blacklist: Set<string>;
-    version: number; // increments when reloaded
+// --- Expanded blacklist rule system ---
+type RuleKind = 'host-substring' | 'host-exact-path' | 'host-subtree-path' | 'subdomain';
+
+interface BlacklistRule {
+    raw: string;
+    kind: RuleKind;
+    host: string; // lowercased host portion
+    path?: string; // for path-based rules, includes leading '/'
+    test(hostLower: string, pathPart: string): boolean;
 }
 
-const access: AccessLists = { blacklist: new Set(), version: 0 };
+interface AccessLists {
+    blacklistRules: BlacklistRule[];
+    version: number;
+}
+
+const access: AccessLists = { blacklistRules: [], version: 0 };
+
+function buildRuleFromLine(line: string): BlacklistRule | null {
+    const raw = line.trim();
+    if (!raw) return null;
+    // Subdomain rule: starts with *.
+    if (raw.startsWith('*.')) {
+        const host = raw.slice(2).toLowerCase();
+        return {
+            raw,
+            kind: 'subdomain',
+            host,
+            test(hostLower) {
+                // match a.b.example.com when rule is *.example.com (requires at least one label before host)
+                return hostLower === host ? false : hostLower.endsWith('.' + host);
+            }
+        };
+    }
+
+    // Path-based rules: contain '/'
+    const slashIndex = raw.indexOf('/');
+    if (slashIndex !== -1) {
+        const hostPart = raw.slice(0, slashIndex).toLowerCase();
+        const pathPart = raw.slice(slashIndex); // includes leading '/'
+        if (pathPart.endsWith('*')) {
+            const prefix = pathPart.slice(0, -1);
+            return {
+                raw,
+                kind: 'host-subtree-path',
+                host: hostPart,
+                path: prefix,
+                test(hostLower, requestPath) {
+                    return hostLower === hostPart && requestPath.startsWith(prefix);
+                }
+            };
+        }
+        // exact host+path match
+        return {
+            raw,
+            kind: 'host-exact-path',
+            host: hostPart,
+            path: pathPart,
+            test(hostLower, requestPath) {
+                return hostLower === hostPart && requestPath === pathPart;
+            }
+        };
+    }
+
+    // Otherwise substring in host
+    const hostNeedle = raw.toLowerCase();
+    return {
+        raw,
+        kind: 'host-substring',
+        host: hostNeedle,
+        test(hostLower) {
+            return hostLower.includes(hostNeedle);
+        }
+    };
+}
 
 function loadLists() {
     try {
+        const rules: BlacklistRule[] = [];
         if (fs.existsSync(BLACKLIST_FILE)) {
-            access.blacklist = new Set(
-                fs.readFileSync(BLACKLIST_FILE, 'utf-8')
-                    .split(/\r?\n/)
-                    .map(l => l.trim())
-                    .map(l => l.toLowerCase())
-                    .filter(Boolean)
-                    .filter(l => !l.startsWith('#'))
-            );
+            const lines = fs.readFileSync(BLACKLIST_FILE, 'utf-8')
+                .split(/\r?\n/)
+                .map(l => l.trim())
+                .filter(Boolean)
+                .filter(l => !l.startsWith('#'));
+            for (const line of lines) {
+                const rule = buildRuleFromLine(line);
+                if (rule) rules.push(rule);
+            }
         }
+        access.blacklistRules = rules;
         access.version++;
-        console.log(`Access lists reloaded v${access.version}: blacklist=${access.blacklist.size}`);
+        console.log(`Access lists reloaded v${access.version}: blacklistRules=${rules.length}`);
     } catch (e) {
         console.error('Failed to load access lists', e);
     }
@@ -59,7 +131,7 @@ app.get('/health', (_req: Request, res: Response) => {
     res.json({
         status: 'ok',
         listsVersion: access.version,
-        blacklist: Array.from(access.blacklist)
+        blacklistRules: access.blacklistRules.map(r => r.raw)
     });
 });
 
@@ -75,10 +147,17 @@ app.use((req: Request, res: Response, next: NextFunction) => {
         return res.status(400).send('Missing target host');
     }
 
-    // Blacklist check (substring match) using lowercased host for comparisons
-    for (const entry of access.blacklist) {
-        if (hostHeaderLower.includes(entry)) {
-            return res.status(403).send('Blocked by blacklist');
+    const pathPart = req.path || '/';
+
+    // Evaluate rules
+    for (const rule of access.blacklistRules) {
+        try {
+            if (rule.test(hostHeaderLower, pathPart)) {
+                console.log(`[blacklist] blocked host="${hostHeaderLower}" path="${pathPart}" rule="${rule.raw}"`);
+                return res.status(403).send('Blocked by blacklist');
+            }
+        } catch (e) {
+            console.error('[blacklist:test:error]', rule.raw, (e as Error).message);
         }
     }
 
@@ -133,9 +212,17 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 
 const server = app.listen(PORT, () => {
     console.log(`Proxy server listening on http://localhost:${PORT}`);
-    console.log(`Lists: blacklist=${access.blacklist.size}`);
+    console.log(`Rules loaded: ${access.blacklistRules.length}`);
     console.log('Chrome MCP: launch with --proxyServer=http://localhost:' + PORT);
     console.log(`Config directory: ${CONFIG_DIR}`);
+    console.log('Blacklist syntax examples:');
+    console.log('  # comment');
+    console.log('  example.com                (substring match in host)');
+    console.log('  realestate.yahoo.co.jp/rent     (exact host+path)');
+    console.log('  realestate.yahoo.co.jp/rent*    (glob subtree)');
+    console.log('  *.tracking.com             (glob)');
+    console.log('  regex:pattern');
+    console.log('  regex:/^api\\.example\\.com\\/v[0-9]+/i');
 });
 
 // Handle HTTP CONNECT (tunneling) so Chrome/clients can use this as an HTTP proxy for HTTPS
@@ -147,12 +234,19 @@ server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head:
 
         const targetHostLower = String(host).toLowerCase();
 
-        // Blacklist check (substring match) using lowercase comparison
-        for (const entry of access.blacklist) {
-            if (targetHostLower.includes(entry)) {
-                clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-                clientSocket.destroy();
-                return;
+        // Blacklist check for CONNECT (host-only rules; cannot inspect path for HTTPS)
+        for (const rule of access.blacklistRules) {
+            // skip rules that require path information (cannot inspect path on CONNECT tunnels)
+            if (rule.kind === 'host-exact-path' || rule.kind === 'host-subtree-path') continue;
+            try {
+                if (rule.test(targetHostLower, '')) {
+                    clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+                    clientSocket.destroy();
+                    console.log(`[blacklist][CONNECT] blocked host="${targetHostLower}" rule="${rule.raw}"`);
+                    return;
+                }
+            } catch (e) {
+                console.error('[blacklist:connect:test:error]', rule.raw, (e as Error).message);
             }
         }
 
